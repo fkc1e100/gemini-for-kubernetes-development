@@ -18,6 +18,7 @@ package repowatch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -43,6 +44,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -53,6 +55,7 @@ import (
 	sandboxtaskv1alpha1 "github.com/gke-labs/gemini-for-kubernetes-development/repo-agent/api/sandboxtask/v1alpha1"
 	"github.com/gke-labs/gemini-for-kubernetes-development/repo-agent/pkg/clients"
 	pkg_github "github.com/gke-labs/gemini-for-kubernetes-development/repo-agent/pkg/github"
+	"github.com/gke-labs/gemini-for-kubernetes-development/repo-agent/pkg/models"
 	"github.com/gke-labs/gemini-for-kubernetes-development/repo-agent/pkg/overseer"
 	"github.com/gke-labs/gemini-for-kubernetes-development/repo-agent/pkg/prompts"
 	"github.com/gke-labs/gemini-for-kubernetes-development/repo-agent/pkg/sandbox"
@@ -322,6 +325,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 	if githubConfig["email"] != "" {
 		user.Email = github.String(githubConfig["email"])
+	}
+	// Fallback to noreply email if missing, to ensure CLA checks pass (and git config is valid)
+	if user.GetEmail() == "" {
+		noreply := fmt.Sprintf("%d+%s@users.noreply.github.com", user.GetID(), user.GetLogin())
+		user.Email = github.String(noreply)
 	}
 
 	var reconcileErr error
@@ -681,6 +689,109 @@ func (r *Reconciler) reconcileReviewSandboxesInternal(ctx context.Context, repoW
 	return watchedPRs, pendingPRs, activeSandboxes
 }
 
+func (r *Reconciler) getLinkedPRs(ctx context.Context, ghClient *github.Client, owner, repo string, issueNumber int) ([]models.LinkedPR, error) {
+	log := klog.FromContext(ctx)
+	// Find PRs linked to this issue
+	// GitHub search API: "type:pr repo:owner/repo issue_number"
+	// linked: qualifier causes 422 Validation Failed "Unsupported type for the closing reference filter"
+	query := fmt.Sprintf("type:pr repo:%s/%s %d", owner, repo, issueNumber)
+	log.Info("Searching for linked PRs", "query", query)
+	opts := &github.SearchOptions{
+		ListOptions: github.ListOptions{PerPage: 10},
+	}
+	result, _, err := ghClient.Search.Issues(ctx, query, opts)
+	if err != nil {
+		log.Error(err, "Search failed", "query", query)
+		return nil, err
+	}
+	log.Info("Search results", "issue", issueNumber, "count", len(result.Issues), "total", result.GetTotal())
+
+	var linkedPRs []models.LinkedPR
+	for _, issue := range result.Issues {
+		if issue.IsPullRequest() {
+			// Get detailed PR status (CI checks)
+			prStatus := "NO_STATUS"
+
+			// Get the PR object to get the head SHA
+			pr, _, err := ghClient.PullRequests.Get(ctx, owner, repo, issue.GetNumber())
+			if err == nil {
+				log.Info("Checking PR status", "pr", issue.GetNumber(), "sha", pr.GetHead().GetSHA())
+				// Check status rollup
+				ref := pr.GetHead().GetSHA()
+				combinedStatus, _, err := ghClient.Repositories.GetCombinedStatus(ctx, owner, repo, ref, nil)
+				if err == nil {
+					log.Info("PR Combined Status", "pr", issue.GetNumber(), "state", combinedStatus.GetState())
+					if combinedStatus.GetState() == "success" {
+						prStatus = "PASSING"
+					} else if combinedStatus.GetState() == "failure" {
+						prStatus = "FAILING"
+					} else if combinedStatus.GetState() == "pending" {
+						prStatus = "PENDING"
+					}
+				} else {
+					log.Error(err, "Failed to get combined status", "pr", issue.GetNumber())
+				}
+				// Always check CheckRuns to catch GitHub Actions failures (even if CombinedStatus is Success)
+				checkRuns, _, err := ghClient.Checks.ListCheckRunsForRef(ctx, owner, repo, ref, nil)
+				if err == nil && checkRuns.Total != nil && *checkRuns.Total > 0 {
+					log.Info("PR Check Runs", "pr", issue.GetNumber(), "total", *checkRuns.Total)
+					allPassed := true
+					anyFailed := false
+					anyPending := false
+					anyRunning := false
+					for _, run := range checkRuns.CheckRuns {
+						if run.GetConclusion() == "failure" || run.GetConclusion() == "timed_out" || run.GetConclusion() == "action_required" {
+							anyFailed = true
+						} else if run.GetStatus() == "in_progress" {
+							anyRunning = true
+						} else if run.GetStatus() == "queued" {
+							anyPending = true
+						} else if run.GetConclusion() != "success" && run.GetConclusion() != "neutral" && run.GetConclusion() != "skipped" {
+							// strictly check success
+						}
+
+						// If explicit failure, we can stop checking others if we only care about setting FAILING?
+						// But for completeness let's iterate.
+					}
+
+					if anyFailed {
+						prStatus = "FAILING"
+					} else if anyRunning {
+						if prStatus != "FAILING" {
+							prStatus = "RUNNING"
+						}
+					} else if anyPending {
+						if prStatus != "FAILING" && prStatus != "RUNNING" {
+							prStatus = "PENDING"
+						}
+					} else if allPassed {
+						// Only upgrade NO_STATUS to PASSING.
+						// Do NOT overwrite PENDING or FAILING from CombinedStatus.
+						if prStatus == "NO_STATUS" {
+							prStatus = "PASSING"
+						}
+					}
+				} else if err != nil {
+					log.Error(err, "Failed to list check runs", "pr", issue.GetNumber())
+				}
+
+			} else {
+				log.Error(err, "Failed to get PR details", "pr", issue.GetNumber())
+			}
+
+			log.Info("PR Final Status", "pr", issue.GetNumber(), "status", prStatus)
+
+			linkedPRs = append(linkedPRs, models.LinkedPR{
+				Number: fmt.Sprintf("%d", issue.GetNumber()),
+				URL:    issue.GetHTMLURL(),
+				Status: prStatus,
+			})
+		}
+	}
+	log.Info("Found Linked PRs", "issue", issueNumber, "count", len(linkedPRs))
+	return linkedPRs, nil
+}
+
 func (r *Reconciler) reconcileIssues(ctx context.Context, repoWatch *reviewv1alpha1.RepoWatch, ghClient *github.Client, owner string, repo string, user *github.User) error {
 	log := log.FromContext(ctx)
 	if repoWatch.Spec.Issue == nil {
@@ -692,6 +803,14 @@ func (r *Reconciler) reconcileIssues(ctx context.Context, repoWatch *reviewv1alp
 		State:       "open",
 		ListOptions: github.ListOptions{PerPage: 100},
 	}
+
+	// Optimization: If assignedToSelf is true, filter by assignee at API level
+	// This significantly reduces the number of issues we need to fetch and process
+	// checks for.
+	if repoWatch.Spec.Issue.AssignedToSelf && user != nil && user.Login != nil {
+		opts.Assignee = *user.Login
+	}
+
 	var allIssues []*github.Issue
 	for {
 		issues, resp, err := ghClient.Issues.ListByRepo(ctx, owner, repo, opts)
@@ -847,6 +966,22 @@ func (r *Reconciler) reconcileIssues(ctx context.Context, repoWatch *reviewv1alp
 				}
 			}
 
+			// Update Linked PRs for existing sandboxes
+			linkedPRs, err := r.getLinkedPRs(ctx, ghClient, owner, repo, *issue.Number)
+			if err != nil {
+				log.Error(err, "failed to get linked PRs", "issue", *issue.Number)
+			}
+			linkedPRsJSON := ""
+			if len(linkedPRs) > 0 {
+				if bytes, err := json.Marshal(linkedPRs); err == nil {
+					linkedPRsJSON = string(bytes)
+				}
+			}
+			if annotations["sandbox.gemini.google.com/linked-pr-status"] != linkedPRsJSON {
+				annotations["sandbox.gemini.google.com/linked-pr-status"] = linkedPRsJSON
+				updateAnnotation = true
+			}
+
 			if updateAnnotation {
 				existingSandbox.SetAnnotations(annotations)
 				if err := r.Update(ctx, existingSandbox); err != nil {
@@ -874,7 +1009,7 @@ func (r *Reconciler) reconcileIssues(ctx context.Context, repoWatch *reviewv1alp
 			if issueIsExplicit || (activeSandboxes < repoWatch.Spec.Issue.MaxActiveSandboxes &&
 				(repoWatch.Spec.Issue.MaxSandboxes == 0 || totalSandboxes < repoWatch.Spec.Issue.MaxSandboxes)) {
 				log.Info("creating sandbox for issue", "issue", *issue.Number)
-				createdSandbox, err := r.createIssueSandbox(ctx, user, repoWatch, issue)
+				createdSandbox, err := r.createIssueSandbox(ctx, user, repoWatch, issue, ghClient, owner, repo)
 				if err != nil {
 					log.Error(err, "unable to create sandbox for issue", "issue", *issue.Number)
 				} else {
@@ -974,7 +1109,7 @@ func (r *Reconciler) isIssueMatch(issue *github.Issue, handler reviewv1alpha1.Is
 	return true
 }
 
-func (r *Reconciler) createIssueSandbox(ctx context.Context, user *github.User, repoWatch *reviewv1alpha1.RepoWatch, issue *github.Issue) (*unstructured.Unstructured, error) {
+func (r *Reconciler) createIssueSandbox(ctx context.Context, user *github.User, repoWatch *reviewv1alpha1.RepoWatch, issue *github.Issue, ghClient *github.Client, owner string, repo string) (*unstructured.Unstructured, error) {
 	log := log.FromContext(ctx)
 	// Base name matches the issue identifier
 	name := fmt.Sprintf("%s-issue-%d", repoWatch.Name, *issue.Number)
@@ -1033,11 +1168,6 @@ func (r *Reconciler) createIssueSandbox(ctx context.Context, user *github.User, 
 		apiKeySecretName = "gemini-vscode-tokens"
 	}
 
-	ephemeralStorage := resource.MustParse("6Gi")
-	if repoWatch.Spec.Issue.DindSupport == reviewv1alpha1.DindSupportPrivileged {
-		ephemeralStorage = resource.MustParse("20Gi")
-	}
-
 	opt := sandbox.AgentSandboxOptions{
 		DevSandboxOptions: sandbox.DevSandboxOptions{
 			Name:      name,
@@ -1047,7 +1177,14 @@ func (r *Reconciler) createIssueSandbox(ctx context.Context, user *github.User, 
 				"sandbox.gemini.google.com/type":     "issue",
 			},
 			Annotations: map[string]string{
-				"agentState": "provisioning",
+				"agentState":                             "provisioning",
+				"sandbox.gemini.google.com/issue-id":     fmt.Sprintf("%d", *issue.Number),
+				"sandbox.gemini.google.com/issue-title":  *issue.Title,
+				"sandbox.gemini.google.com/html-url":     *issue.HTMLURL,
+				"sandbox.gemini.google.com/user-login":   user.GetLogin(),
+				"sandbox.gemini.google.com/repo-url":     repoWatch.Spec.RepoURL,
+				"sandbox.gemini.google.com/branch":       fmt.Sprintf("issue-%d", *issue.Number),
+				"sandbox.gemini.google.com/push-enabled": fmt.Sprintf("%v", false), // Assuming pushBranch is false based on original code
 			},
 			CloneURL:              cloneURL,
 			HTMLURL:               *issue.HTMLURL,
@@ -1080,14 +1217,14 @@ func (r *Reconciler) createIssueSandbox(ctx context.Context, user *github.User, 
 		BotEmail: botEmail,
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("2000m"),
-				corev1.ResourceMemory: resource.MustParse("2Gi"),
-				"ephemeral-storage":   ephemeralStorage,
+				corev1.ResourceCPU:    resource.MustParse("4000m"),
+				corev1.ResourceMemory: resource.MustParse("16Gi"),
+				"ephemeral-storage":   resource.MustParse("40Gi"),
 			},
 			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("4000m"),
-				corev1.ResourceMemory: resource.MustParse("6Gi"),
-				"ephemeral-storage":   ephemeralStorage,
+				corev1.ResourceCPU:    resource.MustParse("8000m"),
+				corev1.ResourceMemory: resource.MustParse("32Gi"),
+				"ephemeral-storage":   resource.MustParse("40Gi"),
 			},
 		},
 	}
@@ -1257,11 +1394,15 @@ func (r *Reconciler) createReviewSandboxForPR(ctx context.Context, repoWatch *re
 									return []interface{}{}
 								}(),
 								"resources": map[string]interface{}{
-									"limits": map[string]interface{}{
-										"ephemeral-storage": "6Gi",
-									},
 									"requests": map[string]interface{}{
-										"ephemeral-storage": "6Gi",
+										"cpu":               "4000m",
+										"memory":            "16Gi",
+										"ephemeral-storage": "40Gi",
+									},
+									"limits": map[string]interface{}{
+										"cpu":               "8000m",
+										"memory":            "32Gi",
+										"ephemeral-storage": "40Gi",
 									},
 								},
 								"env": []interface{}{
